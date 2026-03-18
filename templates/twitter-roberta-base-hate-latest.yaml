@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Deploy a SageMaker endpoint with a REST API Gateway and Route 53 custom domain.'
+
+Parameters:
+  Project:
+    Type: String
+    Description: 'Cost allocation code for tagging resources'
+    Default: 'MLProject'
+
+  ModelName:
+    Type: String
+    Description: 'Name for your SageMaker model'
+    Default: 'TwitterRoBERTaHate'
+
+  shortcode:
+    Type: String
+    Description: 'Short code for cost allocation tagging'
+    Default: ''
+
+  # SageMaker Configuration
+  SageMakerImageUri:
+    Type: String
+    Description: 'URI of the container image for inference'
+    Default: '763104351884.dkr.ecr.us-east-1.amazonaws.com/huggingface-pytorch-inference:2.1.0-transformers4.37.0-cpu-py310-ubuntu22.04'
+
+  HFModelId:
+    Type: String
+    Description: 'Hugging Face model ID to use'
+    Default: 'cardiffnlp/twitter-roberta-base-hate-latest'
+
+  HFTask:
+    Type: String
+    Description: 'Hugging Face task name'
+    Default: 'text-classification'
+
+  InstanceType:
+    Type: String
+    Description: 'Instance type for SageMaker endpoint'
+    Default: 'ml.t2.medium'
+
+  InitialInstanceCount:
+    Type: Number
+    Description: 'Initial instance count for the endpoint'
+    Default: 1
+
+  # Domain & Routing Configuration
+  SubdomainPrefix:
+    Type: String
+    Description: 'Subdomain prefix (e.g., "api" -> api.example.org)'
+    Default: 'twitter-hate'
+
+  RootDomain:
+    Type: String
+    Description: 'Root domain name (e.g., example.org)'
+
+  HostedZoneId:
+    Type: String
+    Description: 'Hosted Zone ID associated with the root domain'
+
+  # Usage Plan Configuration
+  ApiKeyRateLimit:
+    Type: Number
+    Description: 'Rate limit (requests per second) for the usage plan'
+    Default: 20
+
+  ApiKeyBurstLimit:
+    Type: Number
+    Description: 'Burst limit for the usage plan'
+    Default: 5
+
+  ApiKeyMonthlyQuota:
+    Type: Number
+    Description: 'Monthly request quota for the usage plan'
+    Default: 10000
+
+Resources:
+  ### IAM Role for SageMaker ###
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'SageMakerExecutionRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+
+  ### SageMaker Model & Endpoint ###
+  SageMakerModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      ModelName: !Sub '${ModelName}-${AWS::StackName}'
+      PrimaryContainer:
+        Image: !Ref SageMakerImageUri
+        Environment:
+          HF_MODEL_ID: !Ref HFModelId
+          HF_TASK: !Ref HFTask
+
+  SageMakerEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub '${ModelName}-config-${AWS::StackName}'
+      ProductionVariants:
+        - ModelName: !GetAtt SageMakerModel.ModelName
+          VariantName: 'AllTraffic'
+          InitialInstanceCount: !Ref InitialInstanceCount
+          InstanceType: !Ref InstanceType
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: Production
+        - Key: shortcode
+          Value: !Ref shortcode
+
+  SageMakerEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub '${ModelName}-${AWS::StackName}'
+      EndpointConfigName: !GetAtt SageMakerEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: shortcode
+          Value: !Ref shortcode
+
+  ### API Gateway REST API ###
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ModelName}API-${AWS::StackName}'
+      Description: !Sub 'API Gateway for ${ModelName} SageMaker Endpoint'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: shortcode
+          Value: !Ref shortcode
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: predict
+
+  ApiGatewayExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ApiGatewayExecutionRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeSageMakerEndpoint
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                Resource: !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${ModelName}-${AWS::StackName}"
+
+  ApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:runtime.sagemaker:path/endpoints/${ModelName}-${AWS::StackName}/invocations"
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Credentials: !GetAtt ApiGatewayExecutionRole.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestParameters:
+          integration.request.header.Content-Type: "'application/json'"
+        RequestTemplates:
+          application/json: $input.body
+        IntegrationResponses:
+          - StatusCode: 200
+      MethodResponses:
+        - StatusCode: 200
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiGatewayMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: prod
+      DeploymentId: !Ref ApiGatewayDeployment
+      RestApiId: !Ref ApiGateway
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          ThrottlingBurstLimit: 500
+          ThrottlingRateLimit: 1000
+
+  ### API Gateway API Key ###
+  ApiGatewayApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiGatewayDeployment
+    Properties:
+      Name: !Sub '${ModelName}-ApiKey-${AWS::StackName}'
+      Description: 'API Key for SageMaker endpoint access'
+      Enabled: true
+
+  ### API Gateway Usage Plan ###
+  ApiGatewayUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiGatewayDeployment
+    Properties:
+      UsagePlanName: !Sub '${ModelName}-UsagePlan-${AWS::StackName}'
+      Description: 'Usage plan for SageMaker endpoint API'
+      ApiStages:
+        - ApiId: !Ref ApiGateway
+          Stage: !Ref ApiGatewayStage
+      Throttle:
+        RateLimit: !Ref ApiKeyRateLimit
+        BurstLimit: !Ref ApiKeyBurstLimit
+      Quota:
+        Limit: !Ref ApiKeyMonthlyQuota
+        Period: MONTH
+  
+  ApiGatewayUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiGatewayApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiGatewayUsagePlan
+
+  ### ACM Certificate for the Custom Domain ###
+  ApiGatewayCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub '${SubdomainPrefix}.${RootDomain}'
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Sub '${SubdomainPrefix}.${RootDomain}'
+          HostedZoneId: !Ref HostedZoneId
+
+  ### Attach Custom Domain to API Gateway ###
+  ApiGatewayDomain:
+    Type: AWS::ApiGateway::DomainName
+    DependsOn: ApiGatewayCertificate
+    Properties:
+      DomainName: !Sub '${SubdomainPrefix}.${RootDomain}'
+      RegionalCertificateArn: !Ref ApiGatewayCertificate
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiGatewayBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    DependsOn: 
+      - ApiGatewayStage
+      - ApiGatewayDomain
+    Properties:
+      DomainName: !Ref ApiGatewayDomain
+      RestApiId: !Ref ApiGateway
+      Stage: !Ref ApiGatewayStage
+
+  ### Create a Route 53 Record for the API ###
+  Route53RecordSet:
+    Type: AWS::Route53::RecordSet
+    DependsOn: ApiGatewayDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '${SubdomainPrefix}.${RootDomain}'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApiGatewayDomain.RegionalDomainName
+        HostedZoneId: !GetAtt ApiGatewayDomain.RegionalHostedZoneId
+
+Outputs:
+  EndpointURL:
+    Description: 'URL of the deployed API Gateway'
+    Value: !Sub 'https://${SubdomainPrefix}.${RootDomain}/prod/predict'
+  
+  ApiKeyID:
+    Description: 'ID of the API Key created for this endpoint'
+    Value: !Ref ApiGatewayApiKey
+  
+  ApiKeyValue:
+    Description: 'Value of the API Key (retrieve from AWS Console)'
+    Value: 'Retrieve from AWS Console > API Gateway > API Keys'
+  
+  SageMakerEndpointName:
+    Description: 'Name of the SageMaker endpoint'
+    Value: !Sub '${ModelName}-${AWS::StackName}'
