@@ -582,6 +582,12 @@ For issues related to:
 - **Hugging Face Models:** Visit [Hugging Face forums](https://discuss.huggingface.co/)
 - **Model-specific questions:** Check the model card on Hugging Face
 
+# Acknowledgements
+
+<img src="https://www.imls.gov/sites/default/files/imls_logo_2c.jpg" alt="IMLS Logo" width="200">
+
+This project was made possible in part by the [Institute of Museum and Library Services LG-256665-OLS-24](https://www.imls.gov/grants/awarded/lg-256665-ols-24).
+
 ---
 
 **Note:** These templates are designed for us-east-1 region. To deploy in other regions, update the `SageMakerImageUri` parameter with the appropriate regional ECR image URI and specify `--region` in all AWS CLI commands.
